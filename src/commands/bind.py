@@ -16,7 +16,7 @@ def setup(bot: commands.Bot) -> None:
     )
     @requires_manage_channels()
     @app_commands.describe(
-        use_webhook="Whether or not to use webhooks for stylized relays."
+        use_webhook="Use a channel webhook for relayed messages instead of normal bot messages."
     )
     async def bind(ctx: commands.Context[commands.Bot], use_webhook: bool = True) -> None:
         guild = ctx.guild
