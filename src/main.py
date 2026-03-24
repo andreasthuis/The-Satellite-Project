@@ -19,6 +19,7 @@ from src.redis_client import (
 
 LOGGER = logging.getLogger(__name__)
 ALLOWED_MENTIONS = discord.AllowedMentions.none()
+ALLOWED_MENTIONS.users = True
 
 
 class SatelliteBot(commands.Bot):
@@ -122,7 +123,7 @@ def build_relay_content(message: discord.Message) -> str:
     if not parts:
         parts.append("*Sent a message with unsupported content.*")
         
-    parts.append(f"-# from **{message.guild.name}**")
+    parts.append(f"-# by @{message.author.name} from **{message.guild.name}**")
 
     return "\n".join(parts)
 
@@ -223,7 +224,7 @@ def build_bot() -> SatelliteBot:
             if int(guild_id) == guild.id:
                 continue
 
-            LOGGER.info("Distributing message by %s to %s", message.author.name, guild_id)
+            LOGGER.info("Distributing message by %s", message.author.name)
             relay_tasks.append(
                 (guild_id, asyncio.create_task(relay_to_subscription(bot, message, subscription)))
             )

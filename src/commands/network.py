@@ -28,8 +28,7 @@ def build_network_embed(
         guild = bot.get_guild(int(guild_id))
         guild_name = guild.name if guild is not None else f"Unknown Guild ({guild_id})"
         marker = "This server" if guild is not None and guild.id == current_guild.id else guild_name
-        state = "Connected" if subscription["active"] else "Disconnected"
-        delivery = "Webhook" if subscription["webhook"] else "Bot"
+        state = "🔗 Connected" if subscription["active"] else "⛓️‍💥 Disconnected" # i guess i'll deal with it
         lines.append(
             f"**{marker}**: {state}"
         )
