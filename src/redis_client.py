@@ -8,6 +8,7 @@ from redis.asyncio import Redis
 SUBSCRIPTIONS_KEY = "subscriptions"
 RELAY_KEY_PREFIX = "relay"
 REFERENCE_KEY_PREFIX = "reference"
+MOD_KEY = "mod_channel"
 
 
 class Subscription(TypedDict):
@@ -166,6 +167,20 @@ async def get_relayed_messages(source_message_id: int) -> list[RelayedMessage]:
 async def delete_relayed_messages(source_message_id: int) -> None:
     redis_client = get_redis()
     await redis_client.delete(relay_key(source_message_id))
+    
+async def get_mod_channel(guild_id: int):
+    data = await redis.hgetall(f"{MOD_KEY}:{guild_id}")
+    return data or None
+
+
+async def set_mod_channel(guild_id: int, channel_id: int, webhook: str | None):
+    await redis.hset(
+        f"{MOD_KEY}:{guild_id}",
+        mapping={
+            "channel_id": channel_id,
+            "webhook": webhook or "",
+        },
+    )
 
 
 """

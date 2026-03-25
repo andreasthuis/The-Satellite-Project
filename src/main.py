@@ -9,6 +9,8 @@ import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 
+from src.buttons import ModActionsView
+
 from src.commands import register_commands
 from src.redis_client import (
     RelayedMessage,
@@ -58,6 +60,9 @@ class SatelliteBot(commands.Bot):
             )
 
         await sync_command_tree(self)
+        
+        from src.buttons import ModActionsView
+        self.add_view(ModActionsView())
 
     async def close(self) -> None:
         await close_redis()
@@ -434,7 +439,35 @@ async def delete_relayed_message(
 
     destination_message = await channel.fetch_message(relayed_message["message_id"])
     await destination_message.delete()
+    
+async def send_mod_log(bot: SatelliteBot, guild: discord.Guild, content: str, target_id: int | None = None):
+    from src.redis_client import get_mod_channel
+    from src.buttons import make_mod_log_view
+    
+    sub = await get_mod_channel(guild.id)
+    if not sub:
+        return
 
+    view = make_mod_log_view(target_id) if target_id else None
+    
+    channel_id = sub.get("channel_id")
+    if not channel_id:
+        return
+
+    channel = guild.get_channel(int(channel_id))
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(int(channel_id))
+        except discord.HTTPException:
+            LOGGER.error(f"Could not find mod channel {channel_id} in guild {guild.id}")
+            return
+
+    try:
+        await channel.send(content, view=view)
+    except discord.Forbidden:
+        LOGGER.error(f"Missing permissions to send messages in {channel_id}")
+    except discord.HTTPException as e:
+        LOGGER.error(f"Failed to send mod log: {e}")
 
 def build_bot() -> SatelliteBot:
     bot = SatelliteBot()
@@ -522,52 +555,79 @@ def build_bot() -> SatelliteBot:
     async def on_message_edit(before: discord.Message, after: discord.Message) -> None:
         if after.author.bot:
             return
+        
+        if before.guild and before.content != after.content:
+            await send_mod_log(
+                bot,
+                before.guild,
+                f"**Edited:** {before.author} in {before.channel.mention}\n"
+                f"**Before:** {before.content}\n**After:** {after.content}",
+                target_id=before.author.id
+            )
+
         if before.content == after.content and before.attachments == after.attachments:
             return
 
         relayed_messages = await get_relayed_messages(after.id)
-        if not relayed_messages:
-            return
+        if relayed_messages:
+            results = await asyncio.gather(
+                *(edit_relayed_message(bot, after, rm) for rm in relayed_messages),
+                return_exceptions=True,
+            )
+            
+            for rm in relayed_messages:
+                dest_guild = bot.get_guild(rm["guild_id"])
+                if dest_guild:
+                    await send_mod_log(
+                        bot, 
+                        dest_guild, 
+                        f"**Relayed Message Edited** (Original by {after.author})\n"
+                        f"**New Content:** {after.content[:500]}",
+                        target_id=before.author.id
+                    )
 
-        results = await asyncio.gather(
-            *(edit_relayed_message(bot, after, relayed_message) for relayed_message in relayed_messages),
-            return_exceptions=True,
-        )
-        for relayed_message, result in zip(relayed_messages, results, strict=True):
-            if isinstance(result, Exception):
-                LOGGER.exception(
-                    "Failed to edit relayed message %s in channel %s.",
-                    relayed_message["message_id"],
-                    relayed_message["channel_id"],
-                    exc_info=result,
-                )
+            for rm, res in zip(relayed_messages, results):
+                if isinstance(res, Exception):
+                    LOGGER.exception("Failed to edit relay in %s", rm["channel_id"], exc_info=res)
 
     @bot.event
     async def on_message_delete(message: discord.Message) -> None:
         if message.author and message.author.bot:
             return
 
+        if message.guild:
+            content_snippet = message.content or "[No text content]"
+            await send_mod_log(
+                bot,
+                message.guild,
+                f"**Deleted:** {message.author} in {message.channel.mention}\n{content_snippet}",
+                target_id=before.author.id
+            )
+
         relayed_messages = await get_relayed_messages(message.id)
-        if not relayed_messages:
-            return
+        if relayed_messages:
+            for rm in relayed_messages:
+                dest_guild = bot.get_guild(rm["guild_id"])
+                if dest_guild:
+                    await send_mod_log(
+                        bot, 
+                        dest_guild, 
+                        f"**Relayed Message Deleted** (Original by {message.author})\n"
+                        f"**Content was:** {message.content[:500] if message.content else '[No text]'}",
+                        target_id=before.author.id
+                    )
 
-        results = await asyncio.gather(
-            *(delete_relayed_message(bot, relayed_message) for relayed_message in relayed_messages),
-            return_exceptions=True,
-        )
-        for relayed_message, result in zip(relayed_messages, results, strict=True):
-            if isinstance(result, Exception):
-                LOGGER.exception(
-                    "Failed to delete relayed message %s in channel %s.",
-                    relayed_message["message_id"],
-                    relayed_message["channel_id"],
-                    exc_info=result,
-                )
-
-        await delete_relayed_messages(message.id)
+            results = await asyncio.gather(
+                *(delete_relayed_message(bot, rm) for rm in relayed_messages),
+                return_exceptions=True,
+            )
+            await delete_relayed_messages(message.id)
+            
+            for rm, res in zip(relayed_messages, results):
+                if isinstance(res, Exception):
+                    LOGGER.exception("Failed to delete relay in %s", rm["channel_id"], exc_info=res)
 
     return bot
-
 
 async def run_bot() -> None:
     load_dotenv()
