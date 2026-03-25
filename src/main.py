@@ -310,10 +310,10 @@ async def relay_to_subscription(
     subscription: Subscription,
 ) -> RelayedMessage | None:
     reply_ping_author_id = None
-    
-    if bot.user in message.mentions:
+    is_webhook_message = message.reference.resolved.webhook_id is not None if message.reference and message.reference.resolved else False
+    if bot.user in message.mentions or is_webhook_message:
         reply_ping_author_id = await get_simulated_reply_author_id(message, subscription)
-
+        
     if subscription["webhook"]:
         relay_content = await build_relay_content(
             message,
@@ -357,7 +357,7 @@ async def relay_to_subscription(
             relay_content,
             allowed_mentions=ALLOWED_MENTIONS,
             stickers=message.stickers,
-            mention_author=bot.user in message.mentions,
+            mention_author=reply_ping_author_id is not None,
         )
     else:
         relayed_message = await target_channel.send(
