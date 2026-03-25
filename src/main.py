@@ -31,7 +31,7 @@ ALLOWED_MENTIONS.users = True
 RELAY_AUTHOR_RE = re.compile(r"^-# by @(.+?) in \*\*(.+?)\*\*$")
 URL_RE = re.compile(r"(?<!<)(https?://[^\s>]+)(?!>)")
 
-
+# For starting up the bot
 class SatelliteBot(commands.Bot):
     def __init__(self) -> None:
         intents = discord.Intents.default()
@@ -124,7 +124,7 @@ async def sync_command_tree(bot: SatelliteBot) -> None:
     await bot.tree.sync(guild=guild)
     LOGGER.info("Synchronized command tree to development guild %s", dev_guild_id)
 
-
+# Retrieves the replied message of a message.
 async def resolve_referenced_message(message: discord.Message) -> discord.Message | None:
     reference = message.reference
     if reference is None or reference.message_id is None:
@@ -145,7 +145,7 @@ async def resolve_referenced_message(message: discord.Message) -> discord.Messag
 def wrap_preview_links(text: str) -> str:
     return URL_RE.sub(r"<\1>", text)
 
-
+# For webhook quote replies, constructs the quote reply content of a replied message's content.
 def extract_preview_text(content: str) -> str:
     lines = [line.rstrip() for line in content.splitlines()]
     cleaned_lines: list[str] = []
@@ -155,7 +155,7 @@ def extract_preview_text(content: str) -> str:
         stripped = line.strip()
         if not stripped:
             continue
-        if stripped.startswith("-# by @"):
+        if stripped.startswith("-# by `"):
             quote_closed = True
             continue
         if stripped.startswith("> -# *Replying to a message by"):
@@ -170,7 +170,7 @@ def extract_preview_text(content: str) -> str:
         preview = f"{preview[:117]}..."
     return preview
 
-
+# Returns a formatted author name of a message, usually used in webhook quote replies
 def get_displayed_author(message: discord.Message) -> str:
     lines = [line.strip() for line in message.content.splitlines() if line.strip()]
     for line in reversed(lines):
@@ -179,7 +179,7 @@ def get_displayed_author(message: discord.Message) -> str:
             return f"@{match.group(1)}"
     return f"{message.author.display_name} (@{message.author.name})"
 
-
+# For webhook quote replies, returns the quote reply content for the replied message's content.
 def build_reply_preview(reply_message: discord.Message) -> str:
     preview = extract_preview_text(reply_message.content)
     if not preview and reply_message.attachments:
@@ -188,7 +188,7 @@ def build_reply_preview(reply_message: discord.Message) -> str:
         preview = "[message unavailable]"
     return preview
 
-
+# Constructs the body of a new message.
 async def build_relay_content(
     message: discord.Message,
     *,
@@ -217,11 +217,11 @@ async def build_relay_content(
         parts.append("*Sent a message with unsupported content.*")
 
     guild_name = message.guild.name if message.guild is not None else "Unknown Server"
-    parts.append(f"-# by @{message.author.name} in **{guild_name}**")
+    parts.append(f"-# by `{message.author.name}` in **{guild_name}**")
 
     return "\n".join(parts)
 
-
+# Retrieves a channel to send a message to.
 async def get_target_channel(
     bot: SatelliteBot, subscription: Subscription
 ) -> discord.abc.Messageable | None:
@@ -240,7 +240,7 @@ async def get_target_channel(
 
     return channel
 
-
+# Returns a target message in all servers for replying.
 async def get_relay_reply_target(
     bot: SatelliteBot,
     source_message: discord.Message,
@@ -280,7 +280,7 @@ async def get_relay_reply_target(
     except discord.HTTPException:
         return None
 
-
+# For the webhook quote reply system, returns the UserId of the replied message's author. 
 async def get_simulated_reply_author_id(
     source_message: discord.Message,
     subscription: Subscription,
@@ -307,7 +307,7 @@ async def get_simulated_reply_author_id(
 
     return None
 
-
+# Distributes a new message to all subscribed and connected channels.
 async def relay_to_subscription(
     bot: SatelliteBot,
     message: discord.Message,
@@ -377,7 +377,7 @@ async def relay_to_subscription(
         "author_id": message.author.id,
     }
 
-
+# Edits an existing message and propagates it to all connected channels.
 async def edit_relayed_message(
     bot: SatelliteBot,
     source_message: discord.Message,
@@ -419,7 +419,7 @@ async def edit_relayed_message(
     )
     await destination_message.edit(content=relay_content, allowed_mentions=ALLOWED_MENTIONS)
 
-
+# Deletes an existing message and propagates it to all connected channels.
 async def delete_relayed_message(
     bot: SatelliteBot,
     relayed_message: RelayedMessage,
