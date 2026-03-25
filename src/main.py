@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 
 import discord
 from discord.ext import commands
@@ -10,16 +11,23 @@ from dotenv import load_dotenv
 
 from src.commands import register_commands
 from src.redis_client import (
+    RelayedMessage,
     Subscription,
     close_redis,
+    delete_relayed_messages,
+    get_relay_source,
+    get_relayed_messages,
     get_subscription,
     init_redis,
     list_subscriptions,
+    set_relayed_messages,
 )
 
 LOGGER = logging.getLogger(__name__)
 ALLOWED_MENTIONS = discord.AllowedMentions.none()
 ALLOWED_MENTIONS.users = True
+RELAY_AUTHOR_RE = re.compile(r"^-# by @(.+?) in \*\*(.+?)\*\*$")
+URL_RE = re.compile(r"(?<!<)(https?://[^\s>]+)(?!>)")
 
 
 class SatelliteBot(commands.Bot):
@@ -112,18 +120,94 @@ async def sync_command_tree(bot: SatelliteBot) -> None:
     LOGGER.info("Synchronized command tree to development guild %s", dev_guild_id)
 
 
-def build_relay_content(message: discord.Message) -> str:
+async def resolve_referenced_message(message: discord.Message) -> discord.Message | None:
+    reference = message.reference
+    if reference is None or reference.message_id is None:
+        return None
+
+    if isinstance(reference.resolved, discord.Message):
+        return reference.resolved
+
+    if hasattr(message.channel, "fetch_message"):
+        try:
+            return await message.channel.fetch_message(reference.message_id)
+        except discord.HTTPException:
+            return None
+
+    return None
+
+
+def wrap_preview_links(text: str) -> str:
+    return URL_RE.sub(r"<\1>", text)
+
+
+def extract_preview_text(content: str) -> str:
+    lines = [line.rstrip() for line in content.splitlines()]
+    cleaned_lines: list[str] = []
+
+    quote_closed = False
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("-# by @"):
+            quote_closed = True
+            continue
+        if stripped.startswith("> -# *Replying to a message by"):
+            continue
+        if stripped.startswith(">") and not quote_closed:
+            continue
+        cleaned_lines.append(stripped)
+
+    preview = " ".join(cleaned_lines).strip()
+    preview = wrap_preview_links(preview)
+    if len(preview) > 120:
+        preview = f"{preview[:117]}..."
+    return preview
+
+
+def get_displayed_author(message: discord.Message) -> str:
+    lines = [line.strip() for line in message.content.splitlines() if line.strip()]
+    for line in reversed(lines):
+        match = RELAY_AUTHOR_RE.match(line)
+        if match:
+            return f"@{match.group(1)}"
+    return f"{message.author.display_name} (@{message.author.name})"
+
+
+def build_reply_preview(reply_message: discord.Message) -> str:
+    preview = extract_preview_text(reply_message.content)
+    if not preview and reply_message.attachments:
+        preview = "[attachment]"
+    if not preview:
+        preview = "[message unavailable]"
+    return preview
+
+
+async def build_relay_content(
+    message: discord.Message,
+    *,
+    include_reply_quote: bool,
+) -> str:
     parts: list[str] = []
-    if message.clean_content:
-        parts.append(message.clean_content)
+    reply_message = await resolve_referenced_message(message)
+    if include_reply_quote and reply_message is not None:
+        reply_author = get_displayed_author(reply_message)
+        reply_preview = build_reply_preview(reply_message)
+        parts.append(f"> -# *Replying to a message by {reply_author}*")
+        parts.append(f"> {reply_preview}")
+
+    if message.content:
+        parts.append(message.content)
 
     if message.attachments:
         parts.extend(attachment.url for attachment in message.attachments)
 
-    if not parts:
+    if not any(part and not part.startswith(">") for part in parts):
         parts.append("*Sent a message with unsupported content.*")
-        
-    parts.append(f"-# by @{message.author.name} from **{message.guild.name}**")
+
+    guild_name = message.guild.name if message.guild is not None else "Unknown Server"
+    parts.append(f"-# by @{message.author.name} in **{guild_name}**")
 
     return "\n".join(parts)
 
@@ -147,25 +231,76 @@ async def get_target_channel(
     return channel
 
 
+async def get_relay_reply_target(
+    bot: SatelliteBot,
+    source_message: discord.Message,
+    subscription: Subscription,
+) -> discord.Message | None:
+    reference = source_message.reference
+    print(reference)
+    if reference is None or reference.message_id is None:
+        return None
+
+    relayed_messages = await get_relayed_messages(reference.message_id)
+    target_entry = next(
+        (
+            relayed_message
+            for relayed_message in relayed_messages
+            if relayed_message["channel_id"] == subscription["channel_id"]
+        ),
+        None,
+    )
+    
+    print(target_entry)
+    
+    if target_entry is None:
+        # this might not be the original source
+        target_entry = await get_relay_source(reference.message_id)
+        print(target_entry)
+
+        if not target_entry:
+            return None    
+
+    channel = bot.get_channel(target_entry["channel_id"])
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(target_entry["channel_id"])
+        except discord.HTTPException:
+            return None
+
+    if not hasattr(channel, "fetch_message"):
+        return None
+
+    try:
+        return await channel.fetch_message(target_entry["message_id"])
+    except discord.HTTPException:
+        return None
+
+
 async def relay_to_subscription(
     bot: SatelliteBot,
     message: discord.Message,
+    destination_guild_id: int,
     subscription: Subscription,
-) -> None:
-    relay_content = build_relay_content(message)
-    author_name = message.author.display_name
-    source_name = message.guild.name if message.guild is not None else "Unknown Server"
-
+) -> RelayedMessage | None:
     if subscription["webhook"]:
+        relay_content = await build_relay_content(message, include_reply_quote=True)
         try:
             webhook = discord.Webhook.from_url(subscription["webhook"], client=bot)
-            await webhook.send(
+            relayed_message = await webhook.send(
                 relay_content,
-                username=f"{author_name}",
+                username=f"{message.author.display_name}",
                 avatar_url=message.author.display_avatar.url,
                 allowed_mentions=ALLOWED_MENTIONS,
+                wait=True,
             )
-            return
+            
+            print(relayed_message.id)
+            return {
+                "guild_id": destination_guild_id,
+                "channel_id": subscription["channel_id"],
+                "message_id": relayed_message.id,
+            }
         except discord.HTTPException:
             LOGGER.warning(
                 "Webhook relay failed for channel %s, falling back to bot message.",
@@ -174,12 +309,87 @@ async def relay_to_subscription(
 
     target_channel = await get_target_channel(bot, subscription)
     if target_channel is None:
+        return None
+
+    reply_target = await get_relay_reply_target(bot, message, subscription)
+    relay_content = await build_relay_content(
+        message,
+        include_reply_quote=reply_target is None,
+    )
+    
+    if reply_target is not None:
+        relayed_message = await reply_target.reply(
+            relay_content,
+            allowed_mentions=ALLOWED_MENTIONS,
+            stickers=message.stickers,
+            mention_author=bot.user in message.mentions,
+        )
+    else:
+        relayed_message = await target_channel.send(
+            relay_content,
+            allowed_mentions=ALLOWED_MENTIONS,
+            stickers=message.stickers
+        )
+    return {
+        "guild_id": destination_guild_id,
+        "channel_id": subscription["channel_id"],
+        "message_id": relayed_message.id,
+    }
+
+
+async def edit_relayed_message(
+    bot: SatelliteBot,
+    source_message: discord.Message,
+    relayed_message: RelayedMessage,
+) -> None:
+    destination_subscription = await get_subscription(relayed_message["guild_id"])
+    if destination_subscription is None:
         return
 
-    await target_channel.send(
-        f"**{author_name}**: {relay_content}",
-        allowed_mentions=ALLOWED_MENTIONS,
+    if destination_subscription["webhook"]:
+        relay_content = await build_relay_content(source_message, include_reply_quote=True)
+        webhook = discord.Webhook.from_url(destination_subscription["webhook"], client=bot)
+        await webhook.edit_message(
+            relayed_message["message_id"],
+            content=relay_content,
+            allowed_mentions=ALLOWED_MENTIONS,
+        )
+        return
+
+    channel = bot.get_channel(relayed_message["channel_id"])
+    if channel is None:
+        channel = await bot.fetch_channel(relayed_message["channel_id"])
+
+    if not hasattr(channel, "fetch_message"):
+        return
+
+    destination_message = await channel.fetch_message(relayed_message["message_id"])
+    relay_content = await build_relay_content(
+        source_message,
+        include_reply_quote=destination_message.reference is None,
     )
+    await destination_message.edit(content=relay_content, allowed_mentions=ALLOWED_MENTIONS)
+
+
+async def delete_relayed_message(
+    bot: SatelliteBot,
+    relayed_message: RelayedMessage,
+) -> None:
+    destination_subscription = await get_subscription(relayed_message["guild_id"])
+    if destination_subscription and destination_subscription["webhook"]:
+        webhook = discord.Webhook.from_url(destination_subscription["webhook"], client=bot)
+        await webhook.delete_message(relayed_message["message_id"])
+        return
+
+    channel = bot.get_channel(relayed_message["channel_id"])
+    if channel is None:
+        channel = await bot.fetch_channel(relayed_message["channel_id"])
+
+    if not hasattr(channel, "fetch_message"):
+        return
+
+    destination_message = await channel.fetch_message(relayed_message["message_id"])
+    await destination_message.delete()
 
 
 def build_bot() -> SatelliteBot:
@@ -216,7 +426,7 @@ def build_bot() -> SatelliteBot:
             return
 
         subscriptions = await list_subscriptions()
-        relay_tasks: list[tuple[str, asyncio.Task[None]]] = []
+        relay_tasks: list[tuple[str, asyncio.Task[RelayedMessage | None]]] = []
 
         for guild_id, subscription in subscriptions.items():
             if not subscription["active"]:
@@ -226,7 +436,12 @@ def build_bot() -> SatelliteBot:
 
             LOGGER.info("Distributing message by %s", message.author.name)
             relay_tasks.append(
-                (guild_id, asyncio.create_task(relay_to_subscription(bot, message, subscription)))
+                (
+                    guild_id,
+                    asyncio.create_task(
+                        relay_to_subscription(bot, message, int(guild_id), subscription)
+                    ),
+                )
             )
 
         if not relay_tasks:
@@ -236,6 +451,8 @@ def build_bot() -> SatelliteBot:
             *(task for _, task in relay_tasks),
             return_exceptions=True,
         )
+
+        stored_relays: list[RelayedMessage] = []
         for (guild_id, _), result in zip(relay_tasks, results, strict=True):
             if isinstance(result, Exception):
                 LOGGER.exception(
@@ -243,6 +460,68 @@ def build_bot() -> SatelliteBot:
                     guild_id,
                     exc_info=result,
                 )
+                continue
+
+            if result is not None:
+                stored_relays.append(result)
+
+        print(stored_relays)
+        
+        if stored_relays:
+            relay_source = {
+                "guild_id": guild.id,
+                "channel_id": message.channel.id,
+                "message_id": message.id,
+            }
+            await set_relayed_messages(relay_source, stored_relays)
+
+    @bot.event
+    async def on_message_edit(before: discord.Message, after: discord.Message) -> None:
+        if after.author.bot:
+            return
+        if before.content == after.content and before.attachments == after.attachments:
+            return
+
+        relayed_messages = await get_relayed_messages(after.id)
+        if not relayed_messages:
+            return
+
+        results = await asyncio.gather(
+            *(edit_relayed_message(bot, after, relayed_message) for relayed_message in relayed_messages),
+            return_exceptions=True,
+        )
+        for relayed_message, result in zip(relayed_messages, results, strict=True):
+            if isinstance(result, Exception):
+                LOGGER.exception(
+                    "Failed to edit relayed message %s in channel %s.",
+                    relayed_message["message_id"],
+                    relayed_message["channel_id"],
+                    exc_info=result,
+                )
+
+    @bot.event
+    async def on_message_delete(message: discord.Message) -> None:
+        if message.author and message.author.bot:
+            return
+
+        relayed_messages = await get_relayed_messages(message.id)
+        if not relayed_messages:
+            return
+
+        results = await asyncio.gather(
+            *(delete_relayed_message(bot, relayed_message) for relayed_message in relayed_messages),
+            return_exceptions=True,
+        )
+        for relayed_message, result in zip(relayed_messages, results, strict=True):
+            if isinstance(result, Exception):
+                LOGGER.exception(
+                    "Failed to delete relayed message %s in channel %s.",
+                    relayed_message["message_id"],
+                    relayed_message["channel_id"],
+                    exc_info=result,
+                )
+
+        await delete_relayed_messages(message.id)
 
     return bot
 
