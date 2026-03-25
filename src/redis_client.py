@@ -20,6 +20,7 @@ class RelayedMessage(TypedDict):
     guild_id: int
     channel_id: int
     message_id: int
+    author_id: int
 
 
 redis: Redis | None = None
@@ -34,8 +35,18 @@ def parse_subscription(raw_subscription: str) -> Subscription:
     }
 
 
+def parse_relayed_message(entry: dict[str, int | str]) -> RelayedMessage:
+    return {
+        "guild_id": int(entry["guild_id"]),
+        "channel_id": int(entry["channel_id"]),
+        "message_id": int(entry["message_id"]),
+        "author_id": int(entry["author_id"]),
+    }
+
+
 def relay_key(source_message_id: int) -> str:
     return f"{RELAY_KEY_PREFIX}:{source_message_id}"
+
 
 def reference_key(relayed_message_id: int) -> str:
     return f"{REFERENCE_KEY_PREFIX}:{relayed_message_id}"
@@ -125,17 +136,22 @@ async def set_relayed_messages(
     relayed_messages: list[RelayedMessage],
 ) -> None:
     redis_client = get_redis()
-    
     source_dump = json.dumps(source_message)
-    
+
     await redis_client.set(relay_key(source_message["message_id"]), json.dumps(relayed_messages))
-    await redis_client.mset({reference_key(key['message_id']): source_dump for key in relayed_messages})
+    await redis_client.mset(
+        {reference_key(relayed_message["message_id"]): source_dump for relayed_message in relayed_messages}
+    )
+
 
 async def get_relay_source(relayed_message_id: int) -> RelayedMessage | None:
     redis_client = get_redis()
-    relay_source = await redis_client.get(reference_key(relayed_message_id))
-    
-    return json.loads(relay_source)
+    raw_relay_source = await redis_client.get(reference_key(relayed_message_id))
+    if raw_relay_source is None:
+        return None
+
+    return parse_relayed_message(json.loads(raw_relay_source))
+
 
 async def get_relayed_messages(source_message_id: int) -> list[RelayedMessage]:
     redis_client = get_redis()
@@ -144,15 +160,8 @@ async def get_relayed_messages(source_message_id: int) -> list[RelayedMessage]:
         return []
 
     parsed = json.loads(raw_relayed_messages)
-    print(raw_relayed_messages)
-    return [
-        {
-            "guild_id": int(entry["guild_id"]),
-            "channel_id": int(entry["channel_id"]),
-            "message_id": int(entry["message_id"]),
-        }
-        for entry in parsed
-    ]
+    return [parse_relayed_message(entry) for entry in parsed]
+
 
 async def delete_relayed_messages(source_message_id: int) -> None:
     redis_client = get_redis()

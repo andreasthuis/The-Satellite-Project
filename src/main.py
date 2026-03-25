@@ -188,11 +188,16 @@ async def build_relay_content(
     message: discord.Message,
     *,
     include_reply_quote: bool,
+    reply_ping_author_id: int | None = None,
 ) -> str:
     parts: list[str] = []
+
     reply_message = await resolve_referenced_message(message)
     if include_reply_quote and reply_message is not None:
-        reply_author = get_displayed_author(reply_message)
+        if reply_ping_author_id is not None:
+            reply_author = (f"<@{reply_ping_author_id}>")
+        else:
+            reply_author = get_displayed_author(reply_message)
         reply_preview = build_reply_preview(reply_message)
         parts.append(f"> -# *Replying to a message by {reply_author}*")
         parts.append(f"> {reply_preview}")
@@ -237,7 +242,6 @@ async def get_relay_reply_target(
     subscription: Subscription,
 ) -> discord.Message | None:
     reference = source_message.reference
-    print(reference)
     if reference is None or reference.message_id is None:
         return None
 
@@ -250,16 +254,11 @@ async def get_relay_reply_target(
         ),
         None,
     )
-    
-    print(target_entry)
-    
-    if target_entry is None:
-        # this might not be the original source
-        target_entry = await get_relay_source(reference.message_id)
-        print(target_entry)
 
-        if not target_entry:
-            return None    
+    if target_entry is None:
+        target_entry = await get_relay_source(reference.message_id)
+        if target_entry is None:
+            return None
 
     channel = bot.get_channel(target_entry["channel_id"])
     if channel is None:
@@ -277,14 +276,50 @@ async def get_relay_reply_target(
         return None
 
 
+async def get_simulated_reply_author_id(
+    source_message: discord.Message,
+    subscription: Subscription,
+) -> int | None:
+    reference = source_message.reference
+    if reference is None or reference.message_id is None:
+        return None
+
+    relayed_messages = await get_relayed_messages(reference.message_id)
+    target_entry = next(
+        (
+            relayed_message
+            for relayed_message in relayed_messages
+            if relayed_message["channel_id"] == subscription["channel_id"]
+        ),
+        None,
+    )
+    if target_entry is not None:
+        return target_entry["author_id"]
+
+    relay_source = await get_relay_source(reference.message_id)
+    if relay_source is not None:
+        return relay_source["author_id"]
+
+    return None
+
+
 async def relay_to_subscription(
     bot: SatelliteBot,
     message: discord.Message,
     destination_guild_id: int,
     subscription: Subscription,
 ) -> RelayedMessage | None:
+    reply_ping_author_id = None
+    
+    if bot.user in message.mentions:
+        reply_ping_author_id = await get_simulated_reply_author_id(message, subscription)
+
     if subscription["webhook"]:
-        relay_content = await build_relay_content(message, include_reply_quote=True)
+        relay_content = await build_relay_content(
+            message,
+            include_reply_quote=True,
+            reply_ping_author_id=reply_ping_author_id,
+        )
         try:
             webhook = discord.Webhook.from_url(subscription["webhook"], client=bot)
             relayed_message = await webhook.send(
@@ -294,12 +329,12 @@ async def relay_to_subscription(
                 allowed_mentions=ALLOWED_MENTIONS,
                 wait=True,
             )
-            
-            print(relayed_message.id)
+
             return {
                 "guild_id": destination_guild_id,
                 "channel_id": subscription["channel_id"],
                 "message_id": relayed_message.id,
+                "author_id": message.author.id,
             }
         except discord.HTTPException:
             LOGGER.warning(
@@ -316,7 +351,7 @@ async def relay_to_subscription(
         message,
         include_reply_quote=reply_target is None,
     )
-    
+
     if reply_target is not None:
         relayed_message = await reply_target.reply(
             relay_content,
@@ -328,12 +363,13 @@ async def relay_to_subscription(
         relayed_message = await target_channel.send(
             relay_content,
             allowed_mentions=ALLOWED_MENTIONS,
-            stickers=message.stickers
+            stickers=message.stickers,
         )
     return {
         "guild_id": destination_guild_id,
         "channel_id": subscription["channel_id"],
         "message_id": relayed_message.id,
+        "author_id": message.author.id,
     }
 
 
@@ -347,7 +383,15 @@ async def edit_relayed_message(
         return
 
     if destination_subscription["webhook"]:
-        relay_content = await build_relay_content(source_message, include_reply_quote=True)
+        reply_ping_author_id = await get_simulated_reply_author_id(
+            source_message,
+            destination_subscription,
+        )
+        relay_content = await build_relay_content(
+            source_message,
+            include_reply_quote=True,
+            reply_ping_author_id=reply_ping_author_id,
+        )
         webhook = discord.Webhook.from_url(destination_subscription["webhook"], client=bot)
         await webhook.edit_message(
             relayed_message["message_id"],
@@ -465,13 +509,12 @@ def build_bot() -> SatelliteBot:
             if result is not None:
                 stored_relays.append(result)
 
-        print(stored_relays)
-        
         if stored_relays:
-            relay_source = {
+            relay_source: RelayedMessage = {
                 "guild_id": guild.id,
                 "channel_id": message.channel.id,
                 "message_id": message.id,
+                "author_id": message.author.id,
             }
             await set_relayed_messages(relay_source, stored_relays)
 
